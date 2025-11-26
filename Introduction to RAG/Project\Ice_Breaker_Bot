@@ -1,0 +1,768 @@
+# config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# API Keys
+PROXYCURL_API_KEY = os.getenv("PROXYCURL_API_KEY", "")
+
+# Watsonx.ai Configuration
+WATSONX_URL = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
+WATSONX_PROJECT_ID = os.getenv("WATSONX_PROJECT_ID", "")
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "ibm/granite-3-2-8b-instruct")
+EMBEDDING_MODEL_ID = os.getenv("EMBEDDING_MODEL_ID", "ibm/slate-125m-english-rtrvr")
+
+# Model Parameters
+TEMPERATURE = 0.0
+MAX_NEW_TOKENS = 1024
+MIN_NEW_TOKENS = 1
+TOP_K = 50
+TOP_P = 1
+
+# Retrieval Parameters
+CHUNK_SIZE = 400
+SIMILARITY_TOP_K = 7
+
+# Mock Data URL
+MOCK_DATA_URL = "https://gist.githubusercontent.com/HaileyTQuach/1e8d7c4d6c9b4b7e6a5d8e9f0a1b2c3d/raw/linkedin_profile.json"
+
+# Prompt Templates
+INITIAL_FACTS_TEMPLATE = """Context information from a LinkedIn profile is below.
+---------------------
+{context_str}
+---------------------
+Using the LinkedIn profile information above, provide 3 interesting facts about this person's career or education background. 
+Focus on notable achievements, career transitions, educational background, or unique professional experiences.
+Make the facts specific and insightful.
+
+3 Interesting Facts:"""
+
+USER_QUESTION_TEMPLATE = """Context information from a LinkedIn profile is below.
+---------------------
+{context_str}
+---------------------
+Given the context information and not prior knowledge, answer the query.
+Query: {query_str}
+Answer: """
+
+print("Configuration loaded successfully!")
+print(f"Chunk Size: {CHUNK_SIZE}")
+print(f"Similarity Top K: {SIMILARITY_TOP_K}")
+print(f"Initial Facts Template: {bool(INITIAL_FACTS_TEMPLATE)}")
+
+# modules/data_extraction.py
+import time
+import requests
+import logging
+from typing import Dict, Optional, Any
+
+import config
+
+logger = logging.getLogger(__name__)
+
+def extract_linkedin_profile(
+    linkedin_profile_url: str, 
+    api_key: Optional[str] = None, 
+    mock: bool = False
+) -> Dict[str, Any]:
+    """Extract LinkedIn profile data using ProxyCurl API or loads a premade JSON file.
+    
+    Args:
+        linkedin_profile_url: The LinkedIn profile URL to extract data from.
+        api_key: ProxyCurl API key. Required if mock is False.
+        mock: If True, loads mock data from a premade JSON file instead of using the API.
+    
+    Returns:
+        Dictionary containing the LinkedIn profile data.
+    """
+    start_time = time.time()
+    
+    try:
+        if mock:
+            logger.info("Using mock data from a premade JSON file...")
+            mock_url = config.MOCK_DATA_URL
+            response = requests.get(mock_url, timeout=30)
+        else:
+            # Ensure API key is provided when mock is False
+            if not api_key:
+                raise ValueError("ProxyCurl API key is required when mock is set to False.")
+            
+            logger.info("Starting to extract the LinkedIn profile...")
+            # Set up the API endpoint and headers
+            api_endpoint = "https://nubela.co/proxycurl/api/v2/linkedin"
+            headers = {
+                "Authorization": f"Bearer {api_key}"
+            }
+            # Prepare parameters for the request
+            params = {
+                "url": linkedin_profile_url,
+                "fallback_to_cache": "on-error",
+                "use_cache": "if-present",
+                "skills": "include",
+                "inferred_salary": "include",
+                "personal_email": "include",
+                "personal_contact_number": "include"
+            }
+            logger.info(f"Sending API request to ProxyCurl at {time.time() - start_time:.2f} seconds...")
+            # Send API request
+            response = requests.get(api_endpoint, headers=headers, params=params, timeout=10)
+        
+        logger.info(f"Received response at {time.time() - start_time:.2f} seconds...")
+        # Check if response is successful
+        if response.status_code == 200:
+            try:
+                # Parse the JSON response
+                data = response.json()
+                
+                # Clean the data, remove empty values and unwanted fields
+                data = {
+                    k: v
+                    for k, v in data.items()
+                    if v not in ([], "", None) and k not in ["people_also_viewed", "certifications"]
+                }
+                # Remove profile picture URLs from groups to clean the data
+                if data.get("groups"):
+                    for group_dict in data.get("groups"):
+                        group_dict.pop("profile_pic_url", None)
+                return data
+            except ValueError as e:
+                logger.error(f"Error parsing JSON response: {e}")
+                logger.error(f"Response content: {response.text[:200]}...")
+                return {}
+        else:
+            logger.error(f"Failed to retrieve data. Status code: {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            return {}
+            
+    except Exception as e:
+        logger.error(f"Error in extract_linkedin_profile: {e}")
+        return {}
+
+print("Data extraction module loaded!")
+
+
+# modules/llm_interface.py
+import logging
+from typing import Dict, Any, Optional
+
+from llama_index.embeddings.ibm import WatsonxEmbeddings
+from llama_index.llms.ibm import WatsonxLLM
+from ibm_watsonx_ai.foundation_models.utils.enums import DecodingMethods
+
+import config
+
+logger = logging.getLogger(__name__)
+
+def create_watsonx_embedding() -> WatsonxEmbeddings:
+    """Creates an IBM Watsonx Embedding model for vector representation.
+    
+    Returns:
+        WatsonxEmbeddings model.
+    """
+    watsonx_embedding = WatsonxEmbeddings(
+        model_id=config.EMBEDDING_MODEL_ID,
+        url=config.WATSONX_URL,
+        project_id=config.WATSONX_PROJECT_ID,
+        truncate_input_tokens=3,
+    )
+    logger.info(f"Created Watsonx Embedding model: {config.EMBEDDING_MODEL_ID}")
+    return watsonx_embedding
+
+def create_watsonx_llm(
+    temperature: float = config.TEMPERATURE,
+    max_new_tokens: int = config.MAX_NEW_TOKENS,
+    decoding_method: str = "sample"
+) -> WatsonxLLM:
+    """Creates an IBM Watsonx LLM for generating responses.
+    
+    Args:
+        temperature: Temperature for controlling randomness in generation (0.0 to 1.0).
+        max_new_tokens: Maximum number of new tokens to generate.
+        decoding_method: Decoding method to use (sample, greedy).
+        
+    Returns:
+        WatsonxLLM model.
+    """
+    additional_params = {
+        "decoding_method": decoding_method,
+        "min_new_tokens": config.MIN_NEW_TOKENS,
+        "top_k": config.TOP_K,
+        "top_p": config.TOP_P,
+    }
+    
+    watsonx_llm = WatsonxLLM(
+        model_id=config.LLM_MODEL_ID,
+        url=config.WATSONX_URL,
+        project_id=config.WATSONX_PROJECT_ID,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        additional_params=additional_params,
+    )
+    
+    logger.info(f"Created Watsonx LLM model: {config.LLM_MODEL_ID}")
+    return watsonx_llm
+
+def change_llm_model(new_model_id: str) -> None:
+    """Change the LLM model to use.
+    
+    Args:
+        new_model_id: New LLM model ID to use.
+    """
+    global config
+    config.LLM_MODEL_ID = new_model_id
+    logger.info(f"Changed LLM model to: {new_model_id}")
+
+print("LLM interface module loaded!")
+
+# modules/data_processing.py
+import json
+import logging
+from typing import Dict, List, Any, Optional
+
+from llama_index.core import Document, VectorStoreIndex
+from llama_index.core.node_parser import SentenceSplitter
+
+from modules.llm_interface import create_watsonx_embedding
+import config
+
+logger = logging.getLogger(__name__)
+
+def split_profile_data(profile_data: Dict[str, Any]) -> List:
+    """Splits the LinkedIn profile JSON data into nodes.
+    
+    Args:
+        profile_data: LinkedIn profile data dictionary.
+        
+    Returns:
+        List of document nodes.
+    """
+    try:
+        # Convert the profile data to a JSON string
+        profile_json = json.dumps(profile_data)
+
+        # Create a Document object from the JSON string
+        document = Document(text=profile_json)
+
+        # Split the document into nodes using SentenceSplitter
+        splitter = SentenceSplitter(chunk_size=config.CHUNK_SIZE)
+        nodes = splitter.get_nodes_from_documents([document])
+        
+        logger.info(f"Created {len(nodes)} nodes from profile data")
+        return nodes
+    except Exception as e:
+        logger.error(f"Error in split_profile_data: {e}")
+        return []
+
+def create_vector_database(nodes: List) -> Optional[VectorStoreIndex]:
+    """Stores the document chunks (nodes) in a vector database.
+    
+    Args:
+        nodes: List of document nodes to be indexed.
+        
+    Returns:
+        VectorStoreIndex or None if indexing fails.
+    """
+    try:
+        # Get the embedding model
+        embedding_model = create_watsonx_embedding()
+
+        # Create a VectorStoreIndex from the nodes
+        index = VectorStoreIndex(
+            nodes=nodes,
+            embed_model=embedding_model,
+            show_progress=True
+        )
+        
+        logger.info("Vector database created successfully")
+        return index
+    except Exception as e:
+        logger.error(f"Error in create_vector_database: {e}")
+        return None
+
+def verify_embeddings(index: VectorStoreIndex) -> bool:
+    """Verify that all nodes have been properly embedded.
+    
+    Args:
+        index: VectorStoreIndex to verify.
+        
+    Returns:
+        True if all embeddings are valid, False otherwise.
+    """
+    try:
+        vector_store = index._storage_context.vector_store
+        node_ids = list(index.index_struct.nodes_dict.keys())
+        missing_embeddings = False
+
+        for node_id in node_ids:
+            embedding = vector_store.get(node_id)
+            if embedding is None:
+                logger.warning(f"Node ID {node_id} has a None embedding.")
+                missing_embeddings = True
+            else:
+                logger.debug(f"Node ID {node_id} has a valid embedding.")
+        
+        if missing_embeddings:
+            logger.warning("Some node embeddings are missing")
+            return False
+        else:
+            logger.info("All node embeddings are valid")
+            return True
+    except Exception as e:
+        logger.error(f"Error in verify_embeddings: {e}")
+        return False
+
+print("Data processing module loaded!")
+
+# modules/query_engine.py
+import logging
+from typing import Any, Dict, Optional
+
+from llama_index.core import VectorStoreIndex, PromptTemplate
+
+from modules.llm_interface import create_watsonx_llm
+import config
+
+logger = logging.getLogger(__name__)
+
+def generate_initial_facts(index: VectorStoreIndex) -> str:
+    """Generates interesting facts about the person's career or education.
+    
+    Args:
+        index: VectorStoreIndex containing the LinkedIn profile data.
+        
+    Returns:
+        String containing interesting facts about the person.
+    """
+    try:
+        # Create LLM for generating facts
+        watsonx_llm = create_watsonx_llm(
+            temperature=0.0,
+            max_new_tokens=500,
+            decoding_method="sample"
+        )
+        
+        # Create prompt template
+        facts_prompt = PromptTemplate(template=config.INITIAL_FACTS_TEMPLATE)
+        
+        # Create query engine
+        query_engine = index.as_query_engine(
+            streaming=False,
+            similarity_top_k=config.SIMILARITY_TOP_K,
+            llm=watsonx_llm,
+            text_qa_template=facts_prompt
+        )
+        
+        # Execute the query
+        query = "Provide three interesting facts about this person's career or education."
+        response = query_engine.query(query)
+        
+        # Return the facts
+        return response.response
+    except Exception as e:
+        logger.error(f"Error in generate_initial_facts: {e}")
+        return "Failed to generate initial facts."
+
+def answer_user_query(index: VectorStoreIndex, user_query: str) -> Any:
+    """Answers the user's question using the vector database and the LLM.
+    
+    Args:
+        index: VectorStoreIndex containing the LinkedIn profile data.
+        user_query: The user's question.
+        
+    Returns:
+        Response object containing the answer to the user's question.
+    """
+    try:
+        # Create LLM for answering questions
+        watsonx_llm = create_watsonx_llm(
+            temperature=0.0,
+            max_new_tokens=250,
+            decoding_method="greedy"
+        )
+        
+        # Create prompt template
+        question_prompt = PromptTemplate(template=config.USER_QUESTION_TEMPLATE)
+        
+        # Retrieve relevant nodes
+        base_retriever = index.as_retriever(similarity_top_k=config.SIMILARITY_TOP_K)
+        source_nodes = base_retriever.retrieve(user_query)
+        
+        # Build context string
+        context_str = "\n\n".join([node.node.get_text() for node in source_nodes])
+        
+        # Create query engine
+        query_engine = index.as_query_engine(
+            streaming=False,
+            similarity_top_k=config.SIMILARITY_TOP_K,
+            llm=watsonx_llm,
+            text_qa_template=question_prompt
+        )
+        
+        # Execute the query
+        answer = query_engine.query(user_query)
+        return answer
+    except Exception as e:
+        logger.error(f"Error in answer_user_query: {e}")
+        return "Failed to get an answer."
+
+print("Query engine module loaded!")
+
+
+# main.py - CLI Version
+import sys
+import time
+import logging
+import argparse
+
+from modules.data_extraction import extract_linkedin_profile
+from modules.data_processing import split_profile_data, create_vector_database, verify_embeddings
+from modules.query_engine import generate_initial_facts, answer_user_query
+import config
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(stream=sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+def process_linkedin(linkedin_url, api_key=None, mock=False):
+    """
+    Processes a LinkedIn URL, extracts data from the profile, and interacts with the user.
+
+    Args:
+        linkedin_url: The LinkedIn profile URL to extract or load mock data from.
+        api_key: ProxyCurl API key. Required if mock is False.
+        mock: If True, loads mock data from a premade JSON file instead of using the API.
+    """
+    try:
+        # Extract the profile data
+        profile_data = extract_linkedin_profile(linkedin_url, api_key, mock=mock)
+        
+        if not profile_data:
+            logger.error("Failed to retrieve profile data.")
+            return
+        
+        # Split the data into nodes
+        nodes = split_profile_data(profile_data)
+        
+        # Store in vector database
+        vectordb_index = create_vector_database(nodes)
+        
+        if not vectordb_index:
+            logger.error("Failed to create vector database.")
+            return
+        
+        # Verify embeddings
+        if not verify_embeddings(vectordb_index):
+            logger.warning("Some embeddings may be missing or invalid.")
+        
+        # Generate and display the initial facts
+        initial_facts = generate_initial_facts(vectordb_index)
+        
+        print("\nHere are 3 interesting facts about this person:")
+        print(initial_facts)
+        
+        # Start the chatbot interface
+        chatbot_interface(vectordb_index)
+        
+    except Exception as e:
+        logger.error(f"Error occurred: {str(e)}")
+
+def chatbot_interface(index):
+    """
+    Provides a simple chatbot interface for user interaction.
+    
+    Args:
+        index: VectorStoreIndex containing the LinkedIn profile data.
+    """
+    print("\nYou can now ask more in-depth questions about this person. Type 'exit', 'quit', or 'bye' to quit.")
+    
+    while True:
+        user_query = input("You: ")
+        if user_query.lower() in ['exit', 'quit', 'bye']:
+            print("Bot: Goodbye!")
+            break
+        
+        print("Bot is typing...", end='')
+        sys.stdout.flush()
+        time.sleep(1)  # Simulate typing delay
+        print('\r', end='')
+        
+        response = answer_user_query(index, user_query)
+        print(f"Bot: {response.response.strip()}\n")
+
+def main():
+    """Main function to run the Icebreaker Bot."""
+    parser = argparse.ArgumentParser(description='Icebreaker Bot - LinkedIn Profile Analyzer')
+    parser.add_argument('--url', type=str, help='LinkedIn profile URL')
+    parser.add_argument('--api-key', type=str, help='API key')
+    parser.add_argument('--mock', action='store_true', help='Use mock data instead of API')
+    parser.add_argument('--model', type=str, help='LLM model to use (e.g., "ibm/granite-3-2-8b-instruct")')
+    
+    args = parser.parse_args()
+    
+    # Use command line arguments or prompt user for input
+    linkedin_url = args.url or input("Enter LinkedIn profile URL (or press Enter to use mock data): ")
+    use_mock = args.mock or not linkedin_url
+    
+    if args.model:
+        from modules.llm_interface import change_llm_model
+        change_llm_model(args.model)
+    
+    api_key = args.api_key or config.PROXYCURL_API_KEY
+    
+    if not use_mock and not api_key:
+        api_key = input("Enter ProxyCurl API key: ")
+    
+    # Use a default URL for mock data if none provided
+    if use_mock and not linkedin_url:
+        linkedin_url = "https://www.linkedin.com/in/leonkatsnelson/"
+    
+    process_linkedin(linkedin_url, api_key, mock=use_mock)
+
+if __name__ == "__main__":
+    main()
+
+# app.py - Gradio Web Interface
+import os
+import sys
+import logging
+import uuid
+import gradio as gr
+
+from modules.data_extraction import extract_linkedin_profile
+from modules.data_processing import split_profile_data, create_vector_database, verify_embeddings
+from modules.llm_interface import change_llm_model
+from modules.query_engine import generate_initial_facts, answer_user_query
+import config
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(stream=sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Dictionary to store active conversations
+active_indices = {}
+
+def process_profile(linkedin_url, api_key, use_mock, selected_model):
+    """Process a LinkedIn profile and generate initial facts.
+    
+    Args:
+        linkedin_url: LinkedIn profile URL to process.
+        api_key: ProxyCurl API key.
+        use_mock: Whether to use mock data.
+        selected_model: LLM model to use.
+        
+    Returns:
+        Initial facts about the profile and a session ID for this conversation.
+    """
+    try:
+        # Change LLM model if needed
+        if selected_model != config.LLM_MODEL_ID:
+            change_llm_model(selected_model)
+            
+        # Use a default URL for mock data if none provided
+        if use_mock and not linkedin_url:
+            linkedin_url = "https://www.linkedin.com/in/leonkatsnelson/"
+            
+        # Extract profile data
+        profile_data = extract_linkedin_profile(
+            linkedin_url,
+            api_key if not use_mock else None,
+            mock=use_mock
+        )
+        
+        if not profile_data:
+            return "Failed to retrieve profile data. Please check the URL or API key.", None
+        
+        # Split data into nodes
+        nodes = split_profile_data(profile_data)
+        
+        if not nodes:
+            return "Failed to process profile data into nodes.", None
+        
+        # Create vector database
+        index = create_vector_database(nodes)
+        
+        if not index:
+            return "Failed to create vector database.", None
+        
+        # Verify embeddings
+        if not verify_embeddings(index):
+            logger.warning("Some embeddings may be missing or invalid")
+        
+        # Generate initial facts
+        facts = generate_initial_facts(index)
+        
+        # Generate a unique session ID
+        session_id = str(uuid.uuid4())
+        
+        # Store the index for this session
+        active_indices[session_id] = index
+        
+        # Return the facts and session ID
+        return f"Profile processed successfully!\n\nHere are 3 interesting facts about this person:\n\n{facts}", session_id
+    
+    except Exception as e:
+        logger.error(f"Error in process_profile: {e}")
+        return f"Error: {str(e)}", None
+
+def chat_with_profile(session_id, user_query, chat_history):
+    """Chat with a processed LinkedIn profile.
+    
+    Args:
+        session_id: Session ID for this conversation.
+        user_query: User's question.
+        chat_history: Chat history.
+        
+    Returns:
+        Updated chat history.
+    """
+    if not session_id:
+        return chat_history + [[user_query, "No profile loaded. Please process a LinkedIn profile first."]]
+    
+    if session_id not in active_indices:
+        return chat_history + [[user_query, "Session expired. Please process the LinkedIn profile again."]]
+    
+    if not user_query.strip():
+        return chat_history
+    
+    try:
+        # Get the index for this session
+        index = active_indices[session_id]
+        
+        # Answer the user's query
+        response = answer_user_query(index, user_query)
+        
+        # Update chat history
+        return chat_history + [[user_query, response.response]]
+    
+    except Exception as e:
+        logger.error(f"Error in chat_with_profile: {e}")
+        return chat_history + [[user_query, f"Error: {str(e)}"]]
+
+def create_gradio_interface():
+    """Create the Gradio interface for the Icebreaker Bot."""
+    # Define available LLM models
+    available_models = [
+        "ibm/granite-3-2-8b-instruct",
+        "meta-llama/llama-3-3-70b-instruct"
+    ]
+    
+    with gr.Blocks(title="LinkedIn Icebreaker Bot") as demo:
+        gr.Markdown("# LinkedIn Icebreaker Bot")
+        gr.Markdown("Generate personalized icebreakers and chat about LinkedIn profiles")
+        
+        with gr.Tab("Process LinkedIn Profile"):
+            with gr.Row():
+                with gr.Column():
+                    linkedin_url = gr.Textbox(
+                        label="LinkedIn Profile URL",
+                        placeholder="https://www.linkedin.com/in/username/"
+                    )
+                    api_key = gr.Textbox(
+                        label="ProxyCurl API Key (Leave empty to use mock data)",
+                        placeholder="Your ProxyCurl API Key",
+                        type="password",
+                        value=config.PROXYCURL_API_KEY
+                    )
+                    use_mock = gr.Checkbox(label="Use Mock Data", value=True)
+                    model_dropdown = gr.Dropdown(
+                        choices=available_models,
+                        label="Select LLM Model",
+                        value=config.LLM_MODEL_ID
+                    )
+                    process_btn = gr.Button("Process Profile")
+                
+                with gr.Column():
+                    result_text = gr.Textbox(label="Initial Facts", lines=10)
+                    session_id = gr.Textbox(label="Session ID", visible=False)
+            
+            process_btn.click(
+                fn=process_profile,
+                inputs=[linkedin_url, api_key, use_mock, model_dropdown],
+                outputs=[result_text, session_id]
+            )
+        
+        with gr.Tab("Chat"):
+            gr.Markdown("Chat with the processed LinkedIn profile")
+            
+            chatbot = gr.Chatbot(height=500)
+            chat_input = gr.Textbox(
+                label="Ask a question about the profile",
+                placeholder="What is this person's current job title?"
+            )
+            
+            chat_btn = gr.Button("Send")
+            
+            chat_btn.click(
+                fn=chat_with_profile,
+                inputs=[session_id, chat_input, chatbot],
+                outputs=[chatbot]
+            )
+            
+            chat_input.submit(
+                fn=chat_with_profile,
+                inputs=[session_id, chat_input, chatbot],
+                outputs=[chatbot]
+            )
+    
+    return demo
+
+if __name__ == "__main__":
+    demo = create_gradio_interface()
+    demo.launch(
+        server_name="127.0.0.1",  
+        server_port=5000,
+        share=True
+    )
+
+
+# requirements.txt (content)
+# Create this as a separate file or run pip install for these packages
+
+"""
+llama-index
+llama-index-embeddings-ibm
+llama-index-llms-ibm
+ibm-watsonx-ai
+gradio
+requests
+python-dotenv
+"""
+Usage Instructions
+1. Install Dependencies:
+bash
+pip install llama-index llama-index-embeddings-ibm llama-index-llms-ibm ibm-watsonx-ai gradio requests python-dotenv
+2. Create .env file:
+bash
+# .env
+PROXYCURL_API_KEY=your_proxycurl_api_key_here
+WATSONX_URL=https://us-south.ml.cloud.ibm.com
+WATSONX_PROJECT_ID=your_watsonx_project_id
+LLM_MODEL_ID=ibm/granite-3-2-8b-instruct
+EMBEDDING_MODEL_ID=ibm/slate-125m-english-rtrvr
+3. Run the application:
+CLI Version:
+
+bash
+python main.py --mock
+Web Interface:
+
+bash
+python app.py
+
+
+print(f"User Question Template: {bool(USER_QUESTION_TEMPLATE)}")
